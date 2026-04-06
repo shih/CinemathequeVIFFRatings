@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TheCinematheque.ca & VIFF Ratings – Douban, IMDb & Letterboxd
 // @namespace    http://tampermonkey.net/
-// @version      1.03
+// @version      1.04
 // @description  Displays Letterboxd, IMDb and Douban ratings on VIFF and The Cinematheque film pages
 // @author       ziban
 // @match        https://viff.org/whats-on/*/
@@ -14,6 +14,7 @@
 // @connect      api.douban.com
 // @connect      letterboxd.com
 // @connect      v3.sg.media-imdb.com
+// @connect      graphql.imdb.com
 // @connect      www.imdb.com
 // @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/567317/TheCinemathequeca%20%20VIFF%20Ratings%20%E2%80%93%20Douban%2C%20IMDb%20%20Letterboxd.user.js
@@ -121,23 +122,55 @@
 
     function getFilmInfo() {
         const host = location.hostname;
-        let rawTitle, releaseYear = null;
+        let rawTitle, releaseYear = null, director = null, akaTitle = null;
 
         if (host === 'thecinematheque.ca') {
             // Title: "The Cinematheque / Film Name"
             const titleParts = document.title.split(' / ');
             rawTitle = titleParts[titleParts.length - 1].trim();
 
-            // Year: from film-detail <ul> whose <li>s have no <a> children
+            // Year, director, aka title: from film-detail <ul> whose <li>s have no <a> children
             const yearRe = /((?:19|20)\d{2})/;
             for (const ul of document.querySelectorAll('ul')) {
                 const lis = [...ul.querySelectorAll(':scope > li')];
                 if (lis.length < 3) continue;
                 if (lis[0].querySelector('a')) continue;
+
+                // Alternate title: either "aka ..." or a plain second title
+                // The <li> at index 1 is an alt title if it's not a year/country,
+                // runtime, rating, or aka-prefixed line
+                for (const li of lis.slice(1, 3)) {
+                    const txt = li.textContent.replace(/\s+/g, ' ').trim();
+                    const akaMatch = txt.match(/^aka\s+(.+)$/i);
+                    if (akaMatch) { akaTitle = akaMatch[1].trim(); break; }
+                    // Plain alternate title: no year, no runtime, no rating pattern
+                    if (yearRe.test(txt)) break;                              // hit year/country — stop
+                    if (/^\d+\s*(min|DCP|Blu|mm)/i.test(txt)) break;
+                    if (/^(NR|G|PG|14A|18A|R|AA|NC-17)$/i.test(txt)) break;
+                    // It's a plain text name — treat as alternate title
+                    if (txt.length > 1) { akaTitle = txt; break; }
+                }
+
+                // Extract year
                 for (const li of lis.slice(1, 5)) {
                     const m = li.textContent.replace(/\s+/g, ' ').trim().match(yearRe);
                     if (m) { releaseYear = m[1]; break; }
                 }
+
+                // Director: the <li> right after the year/country <li> (typically index 3)
+                // It's a plain-text name, not matching year, runtime, or rating patterns
+                for (const li of lis.slice(2, 6)) {
+                    const txt = li.textContent.replace(/\s+/g, ' ').trim();
+                    if (yearRe.test(txt)) continue;                    // year/country line
+                    if (/^\d+\s*(min|DCP|Blu|mm)/i.test(txt)) continue; // runtime line
+                    if (/^(NR|G|PG|14A|18A|R|AA|NC-17)$/i.test(txt)) continue; // rating
+                    if (/^aka\s/i.test(txt)) continue;                 // aka line
+                    if (txt.length > 1 && txt.length < 80 && /^[A-Z\u00C0-\u024F]/.test(txt)) {
+                        director = txt;
+                        break;
+                    }
+                }
+
                 if (releaseYear) break;
             }
         } else {
@@ -170,48 +203,145 @@
         const title = (rawTitle || '')
             .replace(/[\u2018\u2019\u02BC]/g, "'")
             .replace(/[\u201C\u201D]/g, '"');
+        if (akaTitle) {
+            akaTitle = akaTitle
+                .replace(/[\u2018\u2019\u02BC]/g, "'")
+                .replace(/[\u201C\u201D]/g, '"');
+        }
 
-        return { title, releaseYear };
+        return { title, releaseYear, director, akaTitle };
     }
 
     // ─── IMDb ─────────────────────────────────────────────────────────────────
 
-    async function searchImdb(title, year) {
-        const q = encodeURIComponent(`${title}${year ? ' ' + year : ''}`);
+    async function searchImdbSingle(query, year) {
+        const q = encodeURIComponent(query);
         try {
             const res = await gmFetch(`https://v3.sg.media-imdb.com/suggestion/x/${q}.json`);
-            if (res.status !== 200) return null;
+            if (res.status !== 200) return [];
             const data = JSON.parse(res.responseText);
             const results = data?.d || [];
-            const movies = results.filter(r => r.qid === 'movie' || r.qid === 'tvMovie');
-            if (!movies.length) return null;
-            const exact = movies.find(r => String(r.y) === String(year));
-            const hit = exact || movies[0];
-            return { id: hit.id, title: hit.l, year: hit.y, url: `https://www.imdb.com/title/${hit.id}/` };
+            return results.filter(r => r.qid === 'movie' || r.qid === 'tvMovie');
         } catch (e) {
-            return null;
+            return [];
         }
+    }
+
+    function dedupeMovies(movies) {
+        const seen = new Set();
+        return movies.filter(m => { if (seen.has(m.id)) return false; seen.add(m.id); return true; });
+    }
+
+    function yearClose(a, b) {
+        return Math.abs(Number(a) - Number(b)) <= 1;
+    }
+
+    async function verifyDirector(imdbId, director) {
+        // Use GraphQL to check director — avoids WAF bot-challenges on imdb.com
+        try {
+            const query = `query { title(id: "${imdbId}") { directors: credits(first: 5, filter: { categories: ["director"] }) { edges { node { name { nameText { text } } } } } } }`;
+            const res = await new Promise((resolve, reject) => GM_xmlhttpRequest({
+                method: 'POST',
+                url: 'https://graphql.imdb.com/',
+                headers: { 'Content-Type': 'application/json' },
+                data: JSON.stringify({ query }),
+                timeout: 20000,
+                onload: resolve,
+                onerror: reject,
+                ontimeout: () => reject(new Error('Timeout')),
+            }));
+            if (res.status === 200) {
+                const data = JSON.parse(res.responseText);
+                const edges = data?.data?.title?.directors?.edges || [];
+                const dirLower = director.toLowerCase();
+                return edges.some(e => (e.node?.name?.nameText?.text || '').toLowerCase().includes(dirLower));
+            }
+        } catch {}
+        return false;
+    }
+
+    async function searchImdb(title, year, { akaTitle = null, director = null } = {}) {
+        const titles = [title];
+        if (akaTitle) titles.push(akaTitle);
+
+        // Round 1: fire all suggest queries in parallel (with-year + title-only)
+        const queries = [];
+        for (const t of titles) {
+            queries.push(`${t}${year ? ' ' + year : ''}`);
+            queries.push(t); // title-only for broader results
+        }
+        const batches = await Promise.all(queries.map(q => searchImdbSingle(q)));
+        let allMovies = dedupeMovies(batches.flat());
+
+        if (!allMovies.length) return null;
+
+        // Build candidates: prefer exact year, then ±1 year, then all
+        const exactYear = allMovies.filter(r => String(r.y) === String(year));
+        const closeYear = year ? allMovies.filter(r => yearClose(r.y, year)) : allMovies;
+        const candidates = exactYear.length ? exactYear
+            : closeYear.length ? closeYear
+            : allMovies;
+
+        // Fast path: single exact-year match with no director to verify
+        if (exactYear.length === 1 && !director) {
+            const hit = exactYear[0];
+            return { id: hit.id, title: hit.l, year: hit.y, url: `https://www.imdb.com/title/${hit.id}/` };
+        }
+
+        // If we have a director, verify candidates in parallel
+        if (director) {
+            // Combine exact-year and close-year candidates, deduped, up to 5
+            const toVerify = dedupeMovies([...candidates, ...closeYear]).slice(0, 5);
+            const results = await Promise.all(toVerify.map(hit => verifyDirector(hit.id, director).then(ok => ok ? hit : null)));
+            const verified = results.find(r => r !== null);
+            if (verified) {
+                return { id: verified.id, title: verified.l, year: verified.y, url: `https://www.imdb.com/title/${verified.id}/` };
+            }
+        }
+
+        const hit = candidates[0];
+        return { id: hit.id, title: hit.l, year: hit.y, url: `https://www.imdb.com/title/${hit.id}/` };
     }
 
     async function getImdbRating(imdbId) {
         const filmUrl = `https://www.imdb.com/title/${imdbId}/`;
+
+        // Primary: GraphQL API (fast, no WAF issues)
+        try {
+            const query = `query { title(id: "${imdbId}") { ratingsSummary { aggregateRating voteCount } } }`;
+            const res = await new Promise((resolve, reject) => GM_xmlhttpRequest({
+                method: 'POST',
+                url: 'https://graphql.imdb.com/',
+                headers: { 'Content-Type': 'application/json' },
+                data: JSON.stringify({ query }),
+                timeout: 20000,
+                onload: resolve,
+                onerror: reject,
+                ontimeout: () => reject(new Error('Timeout')),
+            }));
+            if (res.status === 200) {
+                const data = JSON.parse(res.responseText);
+                const rv = data?.data?.title?.ratingsSummary?.aggregateRating;
+                if (rv) return { rating: parseFloat(rv).toFixed(1), filmUrl };
+            }
+        } catch (e) {}
+
+        // Fallback: scrape the page (may be blocked by WAF)
         try {
             const res = await gmFetch(filmUrl, { headers: { 'Accept-Language': 'en-US,en;q=0.9' } });
-            if (res.status !== 200) return { rating: null, filmUrl };
-            const doc = parseHTML(res.responseText);
-            for (const script of doc.querySelectorAll('script[type="application/ld+json"]')) {
-                try {
-                    const data = JSON.parse(script.textContent);
-                    const rv = data?.aggregateRating?.ratingValue;
-                    if (rv) return { rating: parseFloat(rv).toFixed(1), filmUrl };
-                } catch {}
+            if (res.status === 200) {
+                const doc = parseHTML(res.responseText);
+                for (const script of doc.querySelectorAll('script[type="application/ld+json"]')) {
+                    try {
+                        const data = JSON.parse(script.textContent);
+                        const rv = data?.aggregateRating?.ratingValue;
+                        if (rv) return { rating: parseFloat(rv).toFixed(1), filmUrl };
+                    } catch {}
+                }
             }
-            const meta = doc.querySelector('meta[itemprop="ratingValue"]');
-            if (meta) return { rating: parseFloat(meta.getAttribute('content')).toFixed(1), filmUrl };
-            return { rating: null, filmUrl };
-        } catch (e) {
-            return { rating: null, filmUrl };
-        }
+        } catch (e) {}
+
+        return { rating: null, filmUrl };
     }
 
     // ─── Douban ───────────────────────────────────────────────────────────────
@@ -224,7 +354,8 @@
                 const results = JSON.parse(res.responseText);
                 if (Array.isArray(results) && results.length > 0) {
                     const movies = results.filter(r => r.type === 'movie');
-                    const hit = movies.find(r => String(r.year) === String(year));
+                    const hit = movies.find(r => String(r.year) === String(year))
+                        || movies.find(r => yearClose(r.year, year));
                     if (hit) { return hit; }
                 }
             }
@@ -388,7 +519,10 @@
             if (!results.length) return null;
             if (year) {
                 const exactMatch = results.find(r => String(r.releaseYear) === String(year));
-                return exactMatch || null;
+                if (exactMatch) return exactMatch;
+                // ±1 year tolerance (Cinematheque may list local release year)
+                const closeMatch = results.find(r => yearClose(r.releaseYear, year));
+                return closeMatch || null;
             }
             return results[0];
         } catch (e) {
@@ -548,12 +682,14 @@
             if (pathParts.length < 3) return;
         }
 
-        const { title, releaseYear } = getFilmInfo();
+        const { title, releaseYear, director, akaTitle } = getFilmInfo();
         if (!title) return;
 
-        const doubanSearchUrl = `https://movie.douban.com/search/subject?search_text=${encodeURIComponent(title)}`;
-        const imdbSearchUrl = `https://www.imdb.com/find/?q=${encodeURIComponent([title, releaseYear].filter(Boolean).join(' '))}&s=tt&ttype=ft`;
-        const lbSearchUrl = `https://letterboxd.com/search/films/${encodeURIComponent([title, releaseYear].filter(Boolean).join(' '))}/`;
+        // Use aka title for search URLs when available (it's typically the English title)
+        const searchTitle = akaTitle || title;
+        const doubanSearchUrl = `https://movie.douban.com/search/subject?search_text=${encodeURIComponent(searchTitle)}`;
+        const imdbSearchUrl = `https://www.imdb.com/find/?q=${encodeURIComponent([searchTitle, releaseYear].filter(Boolean).join(' '))}&s=tt&ttype=ft`;
+        const lbSearchUrl = `https://letterboxd.com/search/films/${encodeURIComponent([searchTitle, releaseYear].filter(Boolean).join(' '))}/`;
 
         const ui = buildWidget();
 
@@ -567,78 +703,85 @@
             }
         }
 
-        const mainFlow = (async () => {
-            // Round 1: IMDb suggest — single fast JSON call, gives us the ID for everything
-            const imdbResult = await searchImdb(title, releaseYear);
+        // All three platforms run independently and update the UI as soon as they resolve.
+        // IMDb search result is shared via a promise so LB/Douban can use the IMDb ID if
+        // their own title-based search is slower.
+
+        let resolveImdbId;
+        const imdbIdPromise = new Promise(r => { resolveImdbId = r; });
+
+        // ── IMDb flow ──────────────────────────────────────────────────────
+        const imdbFlow = (async () => {
+            const imdbResult = await searchImdb(title, releaseYear, { akaTitle, director });
             const imdbId = imdbResult?.id || null;
+            resolveImdbId(imdbId);     // unblock LB/Douban IMDb-based lookups
 
-            if (imdbId) {
-                // Round 2 (parallel): use IMDb ID to query all three platforms simultaneously
-                const [imdbRating, lbResult, doubanByImdb] = await Promise.all([
-                    getImdbRating(imdbId),
-                    getLetterboxdByImdb(imdbId),
-                    searchDoubanByImdb(imdbId),
-                ]);
-
-                // Apply IMDb
-                if (imdbRating.rating) {
-                    ui.setImdb(imdbRating.rating, imdbResult.url, imdbSearchUrl);
-                } else {
-                    ui.setImdb(null, imdbResult.url, imdbSearchUrl, 'no-rating');
-                }
-
-                // Apply LB
-                applyLb(lbResult);
-
-                // Apply Douban — IMDb lookup preferred, title search as fallback
-                const doubanSource = doubanByImdb || await searchDouban(title, releaseYear);
-                if (doubanSource) {
-                    const { rating } = doubanSource._rating !== undefined
-                        ? { rating: doubanSource._rating }
-                        : await getDoubanDetails(doubanSource.id);
-                    if (rating) {
-                        ui.setDouban(rating, doubanSource.url, doubanSearchUrl);
-                    } else {
-                        ui.setDouban(null, doubanSource.url, doubanSearchUrl, 'no-rating');
-                    }
-                } else {
-                    ui.setDouban(null, null, doubanSearchUrl, 'not-found');
-                }
+            if (!imdbId) {
+                ui.setImdb(null, null, imdbSearchUrl, 'not-found');
                 return;
             }
-
-            // Fallback: IMDb suggest found nothing — try LB autocomplete + Douban title search in parallel
-            ui.setImdb(null, null, imdbSearchUrl, 'not-found');
-
-            const lbQuery = [title, releaseYear].filter(Boolean).join(' ');
-            const [lbHit, lbHitNoYear, doubanTitleResult] = await Promise.all([
-                autocompleteLetterboxd(lbQuery, releaseYear),
-                releaseYear ? autocompleteLetterboxd(title) : Promise.resolve(null),
-                searchDouban(title, releaseYear),
-            ]);
-
-            const lbSlug = slugFromHit(lbHit) || slugFromHit(lbHitNoYear);
-            const [lbResult, doubanTitleDetails] = await Promise.all([
-                lbSlug ? getLetterboxdRatingBySlug(lbSlug) : Promise.resolve({ rating: null, filmUrl: null }),
-                doubanTitleResult
-                    ? (doubanTitleResult._rating !== undefined
-                        ? Promise.resolve({ rating: doubanTitleResult._rating })
-                        : getDoubanDetails(doubanTitleResult.id).then(d => ({ rating: d.rating })))
-                    : Promise.resolve({ rating: null }),
-            ]);
-
-            applyLb(lbResult);
-
-            if (doubanTitleResult) {
-                if (doubanTitleDetails.rating) {
-                    ui.setDouban(doubanTitleDetails.rating, doubanTitleResult.url, doubanSearchUrl);
-                } else {
-                    ui.setDouban(null, doubanTitleResult.url, doubanSearchUrl, 'no-rating');
-                }
+            const { rating } = await getImdbRating(imdbId);
+            if (rating) {
+                ui.setImdb(rating, imdbResult.url, imdbSearchUrl);
             } else {
-                ui.setDouban(null, null, doubanSearchUrl, 'not-found');
+                ui.setImdb(null, imdbResult.url, imdbSearchUrl, 'no-rating');
             }
-        })();  // mainFlow
+        })();
+
+        // ── Letterboxd flow ────────────────────────────────────────────────
+        const lbFlow = (async () => {
+            // Start title-based autocomplete immediately (no dependency)
+            const lbQuery = [searchTitle, releaseYear].filter(Boolean).join(' ');
+            const titleSearchP = autocompleteLetterboxd(lbQuery, releaseYear);
+
+            // Also wait for IMDb ID to try the more reliable IMDb→LB redirect
+            const imdbId = await imdbIdPromise;
+            if (imdbId) {
+                const lbResult = await getLetterboxdByImdb(imdbId);
+                if (lbResult.rating || lbResult.filmUrl) { applyLb(lbResult); return; }
+            }
+            // Fall back to title-based search
+            let hit = await titleSearchP;
+            if (!hit) hit = await autocompleteLetterboxd(searchTitle);
+            const slug = slugFromHit(hit);
+            if (slug) {
+                applyLb(await getLetterboxdRatingBySlug(slug));
+            } else {
+                applyLb({ rating: null, filmUrl: null });
+            }
+        })();
+
+        // ── Douban flow ────────────────────────────────────────────────────
+        const doubanFlow = (async () => {
+            // Start title-based search immediately (no dependency)
+            const titleSearchP = (async () => {
+                if (akaTitle) {
+                    const res = await searchDouban(akaTitle, releaseYear);
+                    if (res) return res;
+                }
+                return searchDouban(title, releaseYear);
+            })();
+
+            // Also wait for IMDb ID to try the more reliable API lookup
+            const imdbId = await imdbIdPromise;
+            let source = imdbId ? await searchDoubanByImdb(imdbId) : null;
+            if (!source) source = await titleSearchP;
+
+            if (!source) {
+                ui.setDouban(null, null, doubanSearchUrl, 'not-found');
+                return;
+            }
+            const { rating } = source._rating !== undefined
+                ? { rating: source._rating }
+                : await getDoubanDetails(source.id);
+            if (rating) {
+                ui.setDouban(rating, source.url, doubanSearchUrl);
+            } else {
+                ui.setDouban(null, source.url, doubanSearchUrl, 'no-rating');
+            }
+        })();
+
+        const mainFlow = Promise.all([imdbFlow, lbFlow, doubanFlow]);
 
         let workDone = false;
         mainFlow.finally(() => { workDone = true; });
